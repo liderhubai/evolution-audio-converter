@@ -250,6 +250,157 @@ func convertAudio(inputData []byte, format string) ([]byte, int, error) {
 	return convertedData, duration, nil
 }
 
+func convertVideo(inputData []byte, format string) ([]byte, int, error) {
+	var cmd *exec.Cmd
+
+	switch format {
+	case "mp4":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-c:v", "libx264",
+			"-preset", "medium",
+			"-crf", "23",
+			"-c:a", "aac",
+			"-b:a", "128k",
+			"-movflags", "+faststart",
+			"-f", "mp4",
+			"pipe:1",
+		)
+	case "webm":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-c:v", "libvpx-vp9",
+			"-crf", "30",
+			"-b:v", "0",
+			"-c:a", "libopus",
+			"-b:a", "128k",
+			"-f", "webm",
+			"pipe:1",
+		)
+	case "avi":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-c:v", "libx264",
+			"-crf", "23",
+			"-c:a", "mp3",
+			"-b:a", "128k",
+			"-f", "avi",
+			"pipe:1",
+		)
+	default:
+		// Default to mp4
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-c:v", "libx264",
+			"-preset", "medium",
+			"-crf", "23",
+			"-c:a", "aac",
+			"-b:a", "128k",
+			"-movflags", "+faststart",
+			"-f", "mp4",
+			"pipe:1",
+		)
+	}
+
+	outBuffer := bufferPool.Get().(*bytes.Buffer)
+	errBuffer := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(outBuffer)
+	defer bufferPool.Put(errBuffer)
+
+	outBuffer.Reset()
+	errBuffer.Reset()
+
+	cmd.Stdin = bytes.NewReader(inputData)
+	cmd.Stdout = outBuffer
+	cmd.Stderr = errBuffer
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, 0, fmt.Errorf("error during video conversion: %v, details: %s", err, errBuffer.String())
+	}
+
+	convertedData := make([]byte, outBuffer.Len())
+	copy(convertedData, outBuffer.Bytes())
+
+	// Parse duration from ffmpeg output
+	outputText := errBuffer.String()
+	splitTime := strings.Split(outputText, "time=")
+
+	if len(splitTime) < 2 {
+		return convertedData, 0, nil // Return without duration if not found
+	}
+
+	re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
+	matches := re.FindStringSubmatch(splitTime[len(splitTime)-1])
+	if len(matches) != 4 {
+		return convertedData, 0, nil // Return without duration if format not found
+	}
+
+	hours, _ := strconv.ParseFloat(matches[1], 64)
+	minutes, _ := strconv.ParseFloat(matches[2], 64)
+	seconds, _ := strconv.ParseFloat(matches[3], 64)
+	duration := int(hours*3600 + minutes*60 + seconds)
+
+	return convertedData, duration, nil
+}
+
+func convertImage(inputData []byte, format string) ([]byte, error) {
+	var cmd *exec.Cmd
+
+	switch format {
+	case "jpg", "jpeg":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-q:v", "2",
+			"-f", "image2",
+			"-vcodec", "mjpeg",
+			"pipe:1",
+		)
+	case "png":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-f", "image2",
+			"-vcodec", "png",
+			"pipe:1",
+		)
+	case "webp":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-f", "webp",
+			"-quality", "80",
+			"pipe:1",
+		)
+	case "gif":
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-f", "gif",
+			"pipe:1",
+		)
+	default:
+		// Default to jpeg
+		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+			"-q:v", "2",
+			"-f", "image2",
+			"-vcodec", "mjpeg",
+			"pipe:1",
+		)
+	}
+
+	outBuffer := bufferPool.Get().(*bytes.Buffer)
+	errBuffer := bufferPool.Get().(*bytes.Buffer)
+	defer bufferPool.Put(outBuffer)
+	defer bufferPool.Put(errBuffer)
+
+	outBuffer.Reset()
+	errBuffer.Reset()
+
+	cmd.Stdin = bytes.NewReader(inputData)
+	cmd.Stdout = outBuffer
+	cmd.Stderr = errBuffer
+
+	err := cmd.Run()
+	if err != nil {
+		return nil, fmt.Errorf("error during image conversion: %v, details: %s", err, errBuffer.String())
+	}
+
+	convertedData := make([]byte, outBuffer.Len())
+	copy(convertedData, outBuffer.Bytes())
+
+	return convertedData, nil
+}
+
 func fetchAudioFromURL(url string) ([]byte, error) {
 	resp, err := httpClient.Get(url)
 	if err != nil {
@@ -450,14 +601,28 @@ func transcribeWithGroq(audioData []byte, language string) (string, error) {
 	return result.Text, nil
 }
 
-func uploadToS3(data []byte, format string) (string, error) {
+func uploadToS3(data []byte, format string, mediaType string) (string, error) {
 	if !enableS3Storage || s3Client == nil {
 		return "", errors.New("S3 storage is not enabled or properly configured")
 	}
 
 	// Generate unique filename
 	filename := fmt.Sprintf("%d.%s", time.Now().UnixNano(), format)
-	contentType := fmt.Sprintf("audio/%s", format)
+	
+	// Determine content type based on media type and format
+	var contentType string
+	switch mediaType {
+	case "video":
+		contentType = fmt.Sprintf("video/%s", format)
+	case "image":
+		if format == "jpg" {
+			contentType = "image/jpeg"
+		} else {
+			contentType = fmt.Sprintf("image/%s", format)
+		}
+	default: // audio
+		contentType = fmt.Sprintf("audio/%s", format)
+	}
 
 	// Upload to S3
 	_, err := s3Client.PutObject(
@@ -513,7 +678,7 @@ func processAudio(c *gin.Context) {
 
 	// Handle S3 upload if enabled
 	if enableS3Storage {
-		url, err := uploadToS3(convertedData, format)
+		url, err := uploadToS3(convertedData, format, "audio")
 		if err != nil {
 			fmt.Printf("Error uploading to S3: %v\n", err)
 			// Fallback to base64 if S3 upload fails
@@ -625,6 +790,87 @@ func transcribeOnly(c *gin.Context) {
 	})
 }
 
+func processVideo(c *gin.Context) {
+	if !validateAPIKey(c) {
+		return
+	}
+
+	inputData, err := getInputData(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	format := c.DefaultPostForm("format", "mp4")
+
+	convertedData, duration, err := convertVideo(inputData, format)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	response := gin.H{
+		"duration": duration,
+		"format":   format,
+	}
+
+	// Handle S3 upload if enabled
+	if enableS3Storage {
+		url, err := uploadToS3(convertedData, format, "video")
+		if err != nil {
+			fmt.Printf("Error uploading to S3: %v\n", err)
+			// Fallback to base64 if S3 upload fails
+			response["video"] = base64.StdEncoding.EncodeToString(convertedData)
+		} else {
+			response["url"] = url
+		}
+	} else {
+		response["video"] = base64.StdEncoding.EncodeToString(convertedData)
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
+func processImage(c *gin.Context) {
+	if !validateAPIKey(c) {
+		return
+	}
+
+	inputData, err := getInputData(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	format := c.DefaultPostForm("format", "jpg")
+
+	convertedData, err := convertImage(inputData, format)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	response := gin.H{
+		"format": format,
+	}
+
+	// Handle S3 upload if enabled
+	if enableS3Storage {
+		url, err := uploadToS3(convertedData, format, "image")
+		if err != nil {
+			fmt.Printf("Error uploading to S3: %v\n", err)
+			// Fallback to base64 if S3 upload fails
+			response["image"] = base64.StdEncoding.EncodeToString(convertedData)
+		} else {
+			response["url"] = url
+		}
+	} else {
+		response["image"] = base64.StdEncoding.EncodeToString(convertedData)
+	}
+
+	c.JSON(http.StatusOK, response)
+}
+
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -643,6 +889,8 @@ func main() {
 	router.Use(originMiddleware())
 
 	router.POST("/process-audio", processAudio)
+	router.POST("/process-video", processVideo)
+	router.POST("/process-image", processImage)
 	router.POST("/transcribe", transcribeOnly)
 
 	router.Run(":" + port)
