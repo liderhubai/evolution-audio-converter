@@ -251,152 +251,226 @@ func convertAudio(inputData []byte, format string) ([]byte, int, error) {
 }
 
 func convertVideo(inputData []byte, format string) ([]byte, int, error) {
+	// Create temporary input file - vídeos são mais complexos e FFmpeg precisa analisar completamente
+	tempInputFile, err := os.CreateTemp("", "video-input-*")
+	if err != nil {
+		return nil, 0, fmt.Errorf("error creating temp input file: %v", err)
+	}
+	defer os.Remove(tempInputFile.Name())
+
+	// Write input data to temp file
+	if _, err := tempInputFile.Write(inputData); err != nil {
+		return nil, 0, fmt.Errorf("error writing to temp input file: %v", err)
+	}
+	tempInputFile.Close()
+
+	// Create temporary output file
+	tempOutputFile, err := os.CreateTemp("", "video-output-*."+format)
+	if err != nil {
+		return nil, 0, fmt.Errorf("error creating temp output file: %v", err)
+	}
+	defer os.Remove(tempOutputFile.Name())
+	tempOutputFile.Close()
+
 	var cmd *exec.Cmd
 
 	switch format {
 	case "mp4":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-analyzeduration", "100000000",
+			"-probesize", "100000000",
+			"-i", tempInputFile.Name(),
 			"-c:v", "libx264",
 			"-preset", "medium",
 			"-crf", "23",
 			"-c:a", "aac",
 			"-b:a", "128k",
 			"-movflags", "+faststart",
-			"-f", "mp4",
-			"pipe:1",
+			"-pix_fmt", "yuv420p",
+			"-max_muxing_queue_size", "9999",
+			tempOutputFile.Name(),
 		)
 	case "webm":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-analyzeduration", "100000000",
+			"-probesize", "100000000",
+			"-i", tempInputFile.Name(),
 			"-c:v", "libvpx-vp9",
 			"-crf", "30",
 			"-b:v", "0",
 			"-c:a", "libopus",
 			"-b:a", "128k",
-			"-f", "webm",
-			"pipe:1",
+			"-pix_fmt", "yuv420p",
+			"-max_muxing_queue_size", "9999",
+			tempOutputFile.Name(),
 		)
 	case "avi":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-analyzeduration", "100000000",
+			"-probesize", "100000000",
+			"-i", tempInputFile.Name(),
 			"-c:v", "libx264",
 			"-crf", "23",
 			"-c:a", "mp3",
 			"-b:a", "128k",
-			"-f", "avi",
-			"pipe:1",
+			"-pix_fmt", "yuv420p",
+			"-max_muxing_queue_size", "9999",
+			tempOutputFile.Name(),
 		)
 	default:
 		// Default to mp4
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-analyzeduration", "100000000",
+			"-probesize", "100000000",
+			"-i", tempInputFile.Name(),
 			"-c:v", "libx264",
 			"-preset", "medium",
 			"-crf", "23",
 			"-c:a", "aac",
 			"-b:a", "128k",
 			"-movflags", "+faststart",
-			"-f", "mp4",
-			"pipe:1",
+			"-pix_fmt", "yuv420p",
+			"-max_muxing_queue_size", "9999",
+			tempOutputFile.Name(),
 		)
 	}
 
-	outBuffer := bufferPool.Get().(*bytes.Buffer)
 	errBuffer := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(outBuffer)
 	defer bufferPool.Put(errBuffer)
-
-	outBuffer.Reset()
 	errBuffer.Reset()
 
-	cmd.Stdin = bytes.NewReader(inputData)
-	cmd.Stdout = outBuffer
 	cmd.Stderr = errBuffer
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		return nil, 0, fmt.Errorf("error during video conversion: %v, details: %s", err, errBuffer.String())
 	}
 
-	convertedData := make([]byte, outBuffer.Len())
-	copy(convertedData, outBuffer.Bytes())
+	// Read the converted file
+	convertedData, err := os.ReadFile(tempOutputFile.Name())
+	if err != nil {
+		return nil, 0, fmt.Errorf("error reading converted file: %v", err)
+	}
 
 	// Parse duration from ffmpeg output
 	outputText := errBuffer.String()
-	splitTime := strings.Split(outputText, "time=")
+	var duration int
 
-	if len(splitTime) < 2 {
-		return convertedData, 0, nil // Return without duration if not found
+	// Try to extract duration from Duration line first
+	if strings.Contains(outputText, "Duration:") {
+		re := regexp.MustCompile(`Duration: (\d+):(\d+):(\d+\.\d+)`)
+		matches := re.FindStringSubmatch(outputText)
+		if len(matches) == 4 {
+			hours, _ := strconv.ParseFloat(matches[1], 64)
+			minutes, _ := strconv.ParseFloat(matches[2], 64)
+			seconds, _ := strconv.ParseFloat(matches[3], 64)
+			duration = int(hours*3600 + minutes*60 + seconds)
+		}
 	}
 
-	re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
-	matches := re.FindStringSubmatch(splitTime[len(splitTime)-1])
-	if len(matches) != 4 {
-		return convertedData, 0, nil // Return without duration if format not found
+	// Fallback to time= extraction if Duration not found
+	if duration == 0 {
+		splitTime := strings.Split(outputText, "time=")
+		if len(splitTime) >= 2 {
+			re := regexp.MustCompile(`(\d+):(\d+):(\d+\.\d+)`)
+			matches := re.FindStringSubmatch(splitTime[len(splitTime)-1])
+			if len(matches) == 4 {
+				hours, _ := strconv.ParseFloat(matches[1], 64)
+				minutes, _ := strconv.ParseFloat(matches[2], 64)
+				seconds, _ := strconv.ParseFloat(matches[3], 64)
+				duration = int(hours*3600 + minutes*60 + seconds)
+			}
+		}
 	}
-
-	hours, _ := strconv.ParseFloat(matches[1], 64)
-	minutes, _ := strconv.ParseFloat(matches[2], 64)
-	seconds, _ := strconv.ParseFloat(matches[3], 64)
-	duration := int(hours*3600 + minutes*60 + seconds)
 
 	return convertedData, duration, nil
 }
 
 func convertImage(inputData []byte, format string) ([]byte, error) {
+	// Create temporary input file - para maior compatibilidade com formatos de imagem diversos
+	tempInputFile, err := os.CreateTemp("", "image-input-*")
+	if err != nil {
+		return nil, fmt.Errorf("error creating temp input file: %v", err)
+	}
+	defer os.Remove(tempInputFile.Name())
+
+	// Write input data to temp file
+	if _, err := tempInputFile.Write(inputData); err != nil {
+		return nil, fmt.Errorf("error writing to temp input file: %v", err)
+	}
+	tempInputFile.Close()
+
+	// Create temporary output file
+	outputExt := format
+	if format == "jpg" {
+		outputExt = "jpeg"
+	}
+	tempOutputFile, err := os.CreateTemp("", "image-output-*."+outputExt)
+	if err != nil {
+		return nil, fmt.Errorf("error creating temp output file: %v", err)
+	}
+	defer os.Remove(tempOutputFile.Name())
+	tempOutputFile.Close()
+
 	var cmd *exec.Cmd
 
 	switch format {
 	case "jpg", "jpeg":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-i", tempInputFile.Name(),
 			"-q:v", "2",
-			"-f", "image2",
 			"-vcodec", "mjpeg",
-			"pipe:1",
+			"-pix_fmt", "yuvj420p",
+			tempOutputFile.Name(),
 		)
 	case "png":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
-			"-f", "image2",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-i", tempInputFile.Name(),
 			"-vcodec", "png",
-			"pipe:1",
+			"-pix_fmt", "rgba",
+			tempOutputFile.Name(),
 		)
 	case "webp":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
-			"-f", "webp",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-i", tempInputFile.Name(),
+			"-c:v", "libwebp",
 			"-quality", "80",
-			"pipe:1",
+			"-pix_fmt", "yuva420p",
+			tempOutputFile.Name(),
 		)
 	case "gif":
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
-			"-f", "gif",
-			"pipe:1",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-i", tempInputFile.Name(),
+			"-vf", "palettegen=stats_mode=single[palette];[0:v][palette]paletteuse=new=1",
+			tempOutputFile.Name(),
 		)
 	default:
 		// Default to jpeg
-		cmd = exec.Command("ffmpeg", "-i", "pipe:0",
+		cmd = exec.Command("ffmpeg", "-y",
+			"-i", tempInputFile.Name(),
 			"-q:v", "2",
-			"-f", "image2",
 			"-vcodec", "mjpeg",
-			"pipe:1",
+			"-pix_fmt", "yuvj420p",
+			tempOutputFile.Name(),
 		)
 	}
 
-	outBuffer := bufferPool.Get().(*bytes.Buffer)
 	errBuffer := bufferPool.Get().(*bytes.Buffer)
-	defer bufferPool.Put(outBuffer)
 	defer bufferPool.Put(errBuffer)
-
-	outBuffer.Reset()
 	errBuffer.Reset()
 
-	cmd.Stdin = bytes.NewReader(inputData)
-	cmd.Stdout = outBuffer
 	cmd.Stderr = errBuffer
 
-	err := cmd.Run()
+	err = cmd.Run()
 	if err != nil {
 		return nil, fmt.Errorf("error during image conversion: %v, details: %s", err, errBuffer.String())
 	}
 
-	convertedData := make([]byte, outBuffer.Len())
-	copy(convertedData, outBuffer.Bytes())
+	// Read the converted file
+	convertedData, err := os.ReadFile(tempOutputFile.Name())
+	if err != nil {
+		return nil, fmt.Errorf("error reading converted file: %v", err)
+	}
 
 	return convertedData, nil
 }
